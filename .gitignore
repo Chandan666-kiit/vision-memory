@@ -1,0 +1,10 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+faiss_index/
+*.pptx
+.idea/
+.vscode/

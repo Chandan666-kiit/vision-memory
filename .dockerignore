@@ -1,0 +1,10 @@
+.venv
+venv
+__pycache__
+*.pyc
+faiss_index
+ppt_assets
+*.pptx
+.git
+.env
+.env.*

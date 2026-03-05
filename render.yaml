@@ -1,0 +1,17 @@
+# Deploy at https://render.com (connect GitHub repo)
+# Add OPENAI_API_KEY in Render Dashboard -> Environment
+services:
+  - type: web
+    name: vision-memory
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: FAISS_INDEX_DIR
+        value: /data/faiss_index
+    disk:
+      name: faiss_data
+      mountPath: /data
+      sizeGB: 1

@@ -1,0 +1,16 @@
+# Run with: docker-compose up -d
+# FAISS memory is persisted in ./faiss_data
+services:
+  app:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - FAISS_INDEX_DIR=/data/faiss_index
+    volumes:
+      - faiss_data:/data/faiss_index
+    restart: unless-stopped
+
+volumes:
+  faiss_data:
