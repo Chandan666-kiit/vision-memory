@@ -1,380 +1,230 @@
+"""
+main.py  —  Vision & Memory Pipeline
+"""
 import base64
+import io
 import json
 import os
-import shutil
-import time
-from typing import List, Optional, TypedDict
+from datetime import datetime, timezone
 
-from langchain_community.vectorstores import FAISS
-from langchain_core.documents import Document
-from langchain_openai import OpenAIEmbeddings
-from langgraph.graph import StateGraph, END, START
-from langgraph.store.memory import InMemoryStore
+from bson import ObjectId
+import face_recognition
+import numpy as np
+import faiss
+from PIL import Image
+from pymongo import MongoClient
 from openai import OpenAI
+import streamlit as st
 
-client = OpenAI()
-store = InMemoryStore()
+DIM             = 128
+FAISS_THRESHOLD = 0.9
+TOP_K           = 3
 
+@st.cache_resource
+def _openai() -> OpenAI:
+    return OpenAI()
 
-# ==================================
-#  UTIL
-# ==================================
-def encode_image(path):
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
-
-
-def _api_call_with_retry(messages, max_retries=6, base_wait=3.0):
-    """API call with rate-limit retry. Returns the parsed JSON string from the model."""
-    for attempt in range(max_retries):
-        try:
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-                response_format={"type": "json_object"},
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            is_rate_limit = (
-                getattr(e, "code", None) == "rate_limit_exceeded"
-                or getattr(e, "status_code", None) == 429
-                or "rate limit" in str(e).lower()
-                or "429" in str(e)
-            )
-            if not is_rate_limit or attempt == max_retries - 1:
-                raise
-            time.sleep(base_wait * (2 ** attempt))
-
-
-def _vision_api_call(base64_image: str, prompt: str, parse_key: str, default):
-    """Single-image vision call. Returns (value, raw_json_string)."""
-    raw = _api_call_with_retry([
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
-            ],
-        }
-    ])
-    try:
-        parsed = json.loads(raw)
-        return parsed.get(parse_key, default), raw
-    except Exception:
-        return default, raw
-
-
-# ==================================
-#  LONG TERM MEMORY (FAISS - text memories)
-# ==================================
-def _faiss_index_dir():
-    if os.environ.get("FAISS_INDEX_DIR"):
-        path = os.environ.get("FAISS_INDEX_DIR").strip()
-        os.makedirs(path, exist_ok=True)
-        return path
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "faiss_index")
-
-
-class LongTermMemory:
-    def __init__(self):
-        self.embeddings = OpenAIEmbeddings()
-        index_dir = _faiss_index_dir()
-        index_file = os.path.join(index_dir, "index.faiss")
-
-        if os.path.isfile(index_file):
-            self.vectorstore = FAISS.load_local(
-                index_dir, self.embeddings, allow_dangerous_deserialization=True,
-            )
-        else:
-            os.makedirs(index_dir, exist_ok=True)
-            self.vectorstore = FAISS.from_texts(
-                ["System initialized"], embedding=self.embeddings,
-            )
-            self.vectorstore.save_local(index_dir)
-
-    def add_memory(self, text):
-        self.vectorstore.add_documents([Document(page_content=text)])
-        self.vectorstore.save_local(_faiss_index_dir())
-
-    def retrieve_memory(self, query, k=10):
-        docs = self.vectorstore.similarity_search(query, k=k)
-        return "\n".join([doc.page_content for doc in docs])
-
-
-memory = LongTermMemory()
-
-
-# ==================================
-#  FACE STORE (saves actual images, uses GPT to compare faces)
-# ==================================
-_FACE_REGISTRY = "face_registry.json"
-
-
-def _faces_dir() -> str:
-    d = os.path.join(_faiss_index_dir(), "faces")
-    os.makedirs(d, exist_ok=True)
-    return d
-
-
-def _registry_path() -> str:
-    return os.path.join(_faiss_index_dir(), _FACE_REGISTRY)
-
-
-def _compare_faces(b64_new: str, b64_stored: str) -> bool:
-    """Ask GPT-4o-mini if two face images show the same person."""
-    prompt = (
-        "Look at these two photos. Are they the SAME person? "
-        "Ignore differences in expression, angle, lighting, glasses, clothing, or background. "
-        "Focus ONLY on whether the face/identity is the same person. "
-        "Return ONLY valid JSON: {\"same_person\": true or false}"
+@st.cache_resource
+def _get_col():
+    uri = os.environ.get(
+        "MONGO_URI",
+        "mongodb+srv://chandansrinethvickey_db_user:test1234@cluster0.5cahbo9.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0",
     )
-    raw = _api_call_with_retry([
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_new}"}},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_stored}"}},
-            ],
-        }
-    ])
+    client = MongoClient(uri)
+    return client["vision_memory"]["people"]
+
+@st.cache_resource
+def _get_faiss() -> dict:
+    col = _get_col()
+    bad = col.delete_many({
+        "$or": [
+            {"name": {"$in": ["", "unknown", None]}},
+            {"embedding": {"$exists": False}},
+            {"embedding": []},
+            {"face_b64": {"$exists": False}},
+            {"face_b64": ""},
+        ]
+    })
+    if bad.deleted_count:
+        print(f"[main] Cleaned {bad.deleted_count} corrupt profile(s).")
+    index = faiss.IndexFlatL2(DIM)
+    ids: list[str] = []
+    for doc in col.find({"embedding": {"$exists": True}, "face_b64": {"$exists": True}, "name": {"$nin": ["", None, "unknown"]}}):
+        vec = np.array(doc["embedding"], dtype="float32")
+        index.add(vec.reshape(1, -1))
+        ids.append(str(doc["_id"]))
+    print(f"[main] FAISS ready — {index.ntotal} profile(s).")
+    return {"index": index, "ids": ids}
+
+def get_people_col():
+    return _get_col()
+
+def _crop_face(image_path: str, location: tuple) -> str:
+    img = Image.open(image_path).convert("RGB")
+    top, right, bottom, left = location
+    pad_y = int((bottom - top) * 0.25)
+    pad_x = int((right - left) * 0.25)
+    top    = max(0, top - pad_y)
+    left   = max(0, left - pad_x)
+    bottom = min(img.height, bottom + pad_y)
+    right  = min(img.width, right + pad_x)
+    face   = img.crop((left, top, right, bottom)).resize((224, 224))
+    buf    = io.BytesIO()
+    face.save(buf, format="JPEG", quality=90)
+    return base64.b64encode(buf.getvalue()).decode()
+
+def _full_b64(image_path: str) -> str:
+    with open(image_path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
+def _same_person(live_b64: str, stored_b64: str) -> bool:
     try:
-        return json.loads(raw).get("same_person", False) is True
-    except Exception:
+        res = _openai().chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": (
+                    "You are a face verification system.\n"
+                    "Image 1 = NEW photo. Image 2 = STORED reference.\n\n"
+                    "Are these the SAME person?\n"
+                    "Compare ONLY facial structure: face shape, eyes, nose, mouth, jawline, cheekbones, skin tone.\n"
+                    "IGNORE: hair, glasses, lighting, expression, background.\n"
+                    "Be strict. Only say true if genuinely sure.\n\n"
+                    'Respond JSON only: {"same_person": true/false, "confidence": "high/medium/low", "reason": "one sentence"}'
+                )},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{live_b64}", "detail": "high"}},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{stored_b64}", "detail": "high"}},
+            ]}],
+            response_format={"type": "json_object"},
+            max_tokens=150,
+        )
+        data = json.loads(res.choices[0].message.content)
+        same = bool(data.get("same_person", False))
+        confidence = data.get("confidence", "low")
+        print(f"[main] GPT-4o → same={same} conf={confidence} | {data.get('reason','')}")
+        return same and confidence in ("high", "medium")
+    except Exception as e:
+        print(f"[main] GPT-4o error: {e}")
         return False
 
-
-class FaceStore:
-    """Stores face images on disk. Identifies people by asking GPT to compare faces."""
-
-    def __init__(self):
-        self.registry: List[dict] = []
-        self._load()
-
-    def _load(self) -> None:
-        path = _registry_path()
-        if os.path.isfile(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    self.registry = json.load(f)
-            except Exception:
-                self.registry = []
-
-    def _save(self) -> None:
-        os.makedirs(_faiss_index_dir(), exist_ok=True)
-        with open(_registry_path(), "w", encoding="utf-8") as f:
-            json.dump(self.registry, f, indent=2)
-
-    def add_face(self, name: str, image_path: str) -> None:
-        """Copy the face image and register it with the given name."""
-        filename = f"{name}_{int(time.time())}.jpg"
-        dest = os.path.join(_faces_dir(), filename)
-        shutil.copy2(image_path, dest)
-        self.registry.append({"name": name.strip(), "file": filename})
-        self._save()
-
-    def find_name(self, image_path: str) -> Optional[str]:
-        """Compare the new face against all stored faces. Returns name if match found."""
-        if not self.registry:
-            return None
-        b64_new = encode_image(image_path)
-        seen_names = set()
-        for entry in self.registry:
-            name = entry.get("name", "")
-            if name in seen_names:
-                continue
-            seen_names.add(name)
-            stored_path = os.path.join(_faces_dir(), entry["file"])
-            if not os.path.isfile(stored_path):
-                continue
-            b64_stored = encode_image(stored_path)
-            if _compare_faces(b64_new, b64_stored):
-                return name
-        return None
-
-
-face_store = FaceStore()
-
-
-# ==================================
-#  STATE
-# ==================================
-class VisionState(TypedDict):
-    image_path: str
-    person: bool
-    glasses: bool
-    emotion: str
-    age_estimate: str
-    person_name: str
-    response_text: str
-    need_name: bool
-    greeting_message: str
-
-
-# ==================================
-#  PARALLEL VISION NODES
-# ==================================
-def detect_person(state: VisionState):
-    base64_image = encode_image(state["image_path"])
-    prompt = (
-        "Look at this image. Is there a clear human face/person visible? "
-        "Return ONLY valid JSON, no markdown. Format: {\"person\": true or false}"
-    )
-    value, _ = _vision_api_call(base64_image, prompt, "person", False)
-    return {"person": value}
-
-
-def detect_glasses(state: VisionState):
-    base64_image = encode_image(state["image_path"])
-    prompt = (
-        "Look at this image. Does the person wear glasses (or sunglasses)? "
-        "Return ONLY valid JSON, no markdown. Format: {\"glasses\": true or false}"
-    )
-    value, _ = _vision_api_call(base64_image, prompt, "glasses", False)
-    return {"glasses": value}
-
-
-def detect_emotion(state: VisionState):
-    base64_image = encode_image(state["image_path"])
-    prompt = (
-        "Look at the person's face in this image. What is the dominant emotion? "
-        "Return ONLY valid JSON, no markdown. "
-        "Format: {\"emotion\": \"one word or short phrase, e.g. happy, neutral, surprised\"}"
-    )
-    value, _ = _vision_api_call(base64_image, prompt, "emotion", "")
-    return {"emotion": value if isinstance(value, str) else str(value)}
-
-
-def detect_age(state: VisionState):
-    base64_image = encode_image(state["image_path"])
-    prompt = (
-        "Look at the person in this image. Estimate their age range. "
-        "Return ONLY valid JSON, no markdown. "
-        "Format: {\"age_estimate\": \"e.g. 20-30, 30-40, or a single number\"}"
-    )
-    value, _ = _vision_api_call(base64_image, prompt, "age_estimate", "")
-    return {"age_estimate": value if isinstance(value, str) else str(value)}
-
-
-def merge_vision(state: VisionState):
-    state["response_text"] = json.dumps(
-        {
-            "person": state.get("person", False),
-            "glasses": state.get("glasses", False),
-            "emotion": state.get("emotion", ""),
-            "age_estimate": state.get("age_estimate", ""),
-        },
-        indent=2,
-    )
-    return state
-
-
-# ==================================
-#  IDENTIFY PERSON
-# ==================================
-def identify_person(state: VisionState):
-    if not state.get("person"):
-        return state
-
-    # User submitted their name → save face image + text memory
-    raw_name = state.get("person_name")
-    if raw_name is not None and str(raw_name).strip():
-        name_to_store = str(raw_name).strip()
-        memory.add_memory(
-            f"Name: {name_to_store} | Glasses: {state.get('glasses', False)} | "
-            f"Emotion: {state.get('emotion', '') or ''} | Age: {state.get('age_estimate', '') or ''}"
+def _vj(img_b64: str, prompt: str) -> dict:
+    try:
+        res = _openai().chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": prompt + "\nJSON only. No markdown."},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+            ]}],
+            response_format={"type": "json_object"},
         )
-        face_store.add_face(name_to_store, state["image_path"])
-        state["person_name"] = name_to_store
-        state["need_name"] = False
-        return state
+        return json.loads(res.choices[0].message.content)
+    except Exception as e:
+        print(f"[main] attr error: {e}")
+        return {}
 
-    # Try to recognize by comparing face images
-    matched_name = face_store.find_name(state["image_path"])
-    if matched_name:
-        state["person_name"] = matched_name
-        state["need_name"] = False
-        return state
-
-    state["need_name"] = True
-    state["person_name"] = ""
-    return state
-
-
-# ==================================
-#  GREET
-# ==================================
-def greet(state: VisionState):
-    if not state.get("person"):
-        state["greeting_message"] = "Please provide a valid person image."
-        return state
-    name = state.get("person_name") or "there"
-    parts = []
-    if state.get("glasses"):
-        parts.append("Looking sharp with specs")
-    else:
-        parts.append("No specs today")
-    emotion = (state.get("emotion") or "").strip()
-    age = (state.get("age_estimate") or "").strip()
-    if emotion:
-        parts.append(f"you look {emotion}")
-    if age:
-        parts.append(f"around {age}")
-    extra = (" — " + ", ".join(parts)) if parts else ""
-    state["greeting_message"] = f"Good morning {name}!{extra}."
-    return state
-
-
-# ==================================
-#  BUILD GRAPH
-# ==================================
-graph = StateGraph(VisionState)
-
-graph.add_node("detect_person", detect_person)
-graph.add_node("detect_glasses", detect_glasses)
-graph.add_node("detect_emotion", detect_emotion)
-graph.add_node("detect_age", detect_age)
-graph.add_node("merge_vision", merge_vision)
-graph.add_node("identify", identify_person)
-graph.add_node("greet", greet)
-
-graph.add_edge(START, "detect_person")
-graph.add_edge(START, "detect_glasses")
-graph.add_edge(START, "detect_emotion")
-graph.add_edge(START, "detect_age")
-graph.add_edge("detect_person", "merge_vision")
-graph.add_edge("detect_glasses", "merge_vision")
-graph.add_edge("detect_emotion", "merge_vision")
-graph.add_edge("detect_age", "merge_vision")
-graph.add_edge("merge_vision", "identify")
-graph.add_edge("identify", "greet")
-graph.add_edge("greet", END)
-
-app = graph.compile(store=store)
-
-
-# ==================================
-#  RUN
-# ==================================
-def get_initial_state(image_path: str = "", person_name: str = ""):
+def _detect_attrs(img_b64: str) -> dict:
     return {
-        "image_path": image_path or "",
-        "person": False,
-        "glasses": False,
-        "emotion": "",
-        "age_estimate": "",
-        "person_name": person_name or "",
-        "response_text": "",
-        "need_name": False,
-        "greeting_message": "",
+        "glasses":      bool(_vj(img_b64, '{"glasses": true/false} — wearing glasses?').get("glasses", False)),
+        "emotion":      _vj(img_b64, '{"emotion": "..."} — primary emotion on face?').get("emotion", "neutral"),
+        "age_estimate": _vj(img_b64, '{"age_estimate": "25-30"} — estimated age range?').get("age_estimate", "unknown"),
     }
 
+def _recognise(embedding: list, live_face_b64: str) -> tuple[str, str]:
+    state = _get_faiss()
+    index = state["index"]
+    ids   = state["ids"]
+    if index.ntotal == 0:
+        print("[main] FAISS empty.")
+        return "", ""
+    k    = min(TOP_K, index.ntotal)
+    vec  = np.array(embedding, dtype="float32").reshape(1, -1)
+    D, I = index.search(vec, k)
+    candidates = []
+    for dist, pos in zip(D[0].tolist(), I[0].tolist()):
+        if float(dist) <= FAISS_THRESHOLD and int(pos) < len(ids):
+            candidates.append((float(dist), ids[int(pos)]))
+            print(f"[main] FAISS candidate dist={dist:.4f}")
+    if not candidates:
+        print("[main] No FAISS candidates — unknown person.")
+        return "", ""
+    candidates.sort(key=lambda x: x[0])
+    for dist, mongo_id in candidates:
+        doc = _get_col().find_one({"_id": ObjectId(mongo_id)})
+        if not doc:
+            continue
+        stored_name = (doc.get("name") or "").strip()
+        stored_face = doc.get("face_b64", "")
+        if not stored_name or not stored_face:
+            continue
+        if _same_person(live_face_b64, stored_face):
+            print(f"[main] Confirmed: '{stored_name}'")
+            return stored_name, mongo_id
+        print(f"[main] GPT-4o rejected '{stored_name}'")
+    print("[main] All candidates rejected — unknown.")
+    return "", ""
 
-if __name__ == "__main__":
-    import sys
-    image_path = sys.argv[1] if len(sys.argv) > 1 else ""
-    if not image_path or not os.path.isfile(image_path):
-        print("Usage: python main.py <image_path>")
-        sys.exit(1)
-    result = app.invoke(get_initial_state(image_path))
-    print("Final State:", result)
+def _greeting(name: str, emotion: str, age: str, glasses: bool, is_new: bool) -> str:
+    parts = [f"Hello, {name}! 👋"]
+    if emotion and emotion not in ("", "unknown", "neutral"):
+        parts.append(f"You look {emotion} today.")
+    if age and age not in ("", "unknown"):
+        parts.append(f"You appear to be around {age} years old.")
+    if glasses:
+        parts.append("I see you're wearing glasses.")
+    parts.append("Nice to meet you — I'll remember you! ✨" if is_new else "Welcome back! 🎉")
+    return " ".join(parts)
+
+def analyse_image(image_path: str) -> dict:
+    out = {
+        "person": False, "embedding": [], "face_b64": "",
+        "glasses": False, "emotion": "unknown", "age_estimate": "unknown",
+        "need_name": False, "person_name": "", "greeting_message": "",
+    }
+    image     = face_recognition.load_image_file(image_path)
+    locations = face_recognition.face_locations(image, model="hog")
+    encodings = face_recognition.face_encodings(image, locations)
+    if not encodings:
+        out["greeting_message"] = "No face detected in the image."
+        return out
+    out["person"]    = True
+    out["embedding"] = encodings[0].tolist()
+    out["face_b64"]  = _crop_face(image_path, locations[0])
+    full_b64         = _full_b64(image_path)
+    print(f"[main] Face found. FAISS has {_get_faiss()['index'].ntotal} profile(s).")
+    out.update(_detect_attrs(full_b64))
+    name, mongo_id = _recognise(out["embedding"], out["face_b64"])
+    if not name:
+        out["need_name"] = True
+        return out
+    _get_col().update_one(
+        {"_id": ObjectId(mongo_id)},
+        {"$set": {"emotion": out["emotion"], "last_seen": datetime.now(timezone.utc)}},
+    )
+    out["person_name"]      = name
+    out["greeting_message"] = _greeting(name, out["emotion"], out["age_estimate"], out["glasses"], is_new=False)
+    return out
+
+def register_and_greet(
+    image_path: str, embedding: list, face_b64: str,
+    name: str, glasses: bool, emotion: str, age_estimate: str,
+) -> dict:
+    name = (name or "").strip()
+    if not name or name.lower() == "unknown":
+        return {"error": "Please enter a valid name."}
+    doc = {
+        "name": name, "embedding": embedding, "face_b64": face_b64,
+        "glasses": glasses, "emotion": emotion, "age": age_estimate,
+        "created_at": datetime.now(timezone.utc),
+        "last_seen":  datetime.now(timezone.utc),
+    }
+    inserted = _get_col().insert_one(doc)
+    state = _get_faiss()
+    vec   = np.array(embedding, dtype="float32").reshape(1, -1)
+    state["index"].add(vec)
+    state["ids"].append(str(inserted.inserted_id))
+    print(f"[main] Saved '{name}' FAISS total={state['index'].ntotal}")
+    return {
+        "person": True, "need_name": False,
+        "person_name": name, "glasses": glasses,
+        "emotion": emotion, "age_estimate": age_estimate,
+        "greeting_message": _greeting(name, emotion, age_estimate, glasses, is_new=True),
+    }
