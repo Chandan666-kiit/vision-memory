@@ -5,4 +5,3 @@ faiss-cpu
 face-recognition
 numpy
 Pillow
-bson
