@@ -2,6 +2,6 @@ streamlit
 openai
 pymongo
 faiss-cpu
-face-recognition
 numpy
 Pillow
+face-recognition
